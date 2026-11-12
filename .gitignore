@@ -1,0 +1,3 @@
+# 大文件走 Release，不进仓库
+*.tar.zst
+*.tar.gz
