@@ -1,313 +1,204 @@
 # ARCH DESK
 
-**在 Android 平板上跑一个真正的 Arch Linux ARM 桌面 —— niri + DankMaterialShell。
-不需要 root，不需要解锁 Bootloader，不是虚拟机。**
+在 Android 平板上跑 Arch Linux ARM：合成器是 niri，桌面壳是 DankMaterialShell，应用直接用平板
+自己的 GPU 绘制。不需要 root，不解锁 Bootloader，也不用虚拟机。
 
 [English](README.md) | 简体中文
 
----
-
-ARCH DESK 把一台普通 Android 平板变成 Linux 工作站。用户空间是货真价实的 Arch Linux ARM
-aarch64：有 `pacman`、有滚动更新、有完整的系统库。桌面同样是真正的 Wayland 会话：niri 做合成器，
-DankMaterialShell（DMS）做桌面外壳，应用直接吃平板自己的 GPU。
-
-没有模拟，也没有串流。唯一"属于 Android"的部分是两界之间的传输层：一个把 guest 会话呈现到
-Android `Surface` 上的 Wayland 合成器、一条把 Vulkan 命令交给厂商驱动的桥，以及几座让桌面能看见
-Android 手里硬件（音频、网络、蓝牙、输入）的小桥。
-
-本仓库是这个用户空间的**分发通道**：App 读取的 catalog、把官方 Arch Linux ARM 压缩包变成桌面的
-provision 配方，以及给"不想等首次配置"的人准备的预构建运行时。
-
 | | |
 | --- | --- |
-| 平台 | Android 8.0+（`arm64-v8a`），在 Android 16 上验证 |
-| root | **不需要** —— guest 跑在 PRoot 里 |
+| 平台 | Android 8.0+，`arm64-v8a`，在 Android 16 上开发 |
+| root | 不需要，guest 跑在 PRoot 里 |
 | 桌面 | niri 26.04 + DankMaterialShell 2.1 |
-| 图形 | Mesa `zink` → Vulkan（Venus）→ Mali-G925，dmabuf 呈现 |
-| 体积 | 解压约 4.8 GB，下载 830 MB – 1.76 GB |
+| 图形 | Mesa zink → Vulkan（Venus）→ Mali-G925，以 dmabuf 呈现 |
+| 磁盘 | 下载 830 MB – 1.76 GB，装完约 4.8 GB |
 | 首次安装 | 正常网络下 10–20 分钟 |
 
----
+这个仓库放三样东西：App 读取的 catalog、把官方 Arch Linux ARM 压缩包变成桌面的安装脚本、以及
+给不想等首次配置的人准备的预构建运行时。App 和原生合成器的源码在应用仓库里。
 
-## 目录
+## 硬件
 
-- [为什么做这个](#为什么做这个)
-- [它是怎么工作的](#它是怎么工作的)
-- [这个仓库里有什么](#这个仓库里有什么)
-- [安装](#安装)
-- [已验证的硬件](#已验证的硬件)
-- [设计取舍](#设计取舍)
-- [已知不足](#已知不足)
-- [路线图](#路线图)
-- [仓库结构](#仓库结构)
-- [许可](#许可)
+2026 年的中端平板有 8 个核、一块不弱的 GPU、8–16 GB 内存和 3K 屏，比多数人上网用的笔记本强。
+Android 把这些硬件全用在了手机界面上。想在它上面要一个桌面，常见做法要么模拟 CPU，要么用 CPU
+画图：
 
----
-
-## 为什么做这个
-
-今天的平板比大多数人上网用的笔记本更强：八核、新一代 GPU、8–16 GB 内存、3K 屏、续航一整天。
-Android 把这些算力全给了手机界面。现成的几条退路都不够好：
-
-| 方案 | 给你什么 | 缺什么 |
+| | CPU | 渲染 |
 | --- | --- | --- |
-| SSH / VNC 连远程机器 | 一个真桌面 | 依赖网络、有延迟、用不上本地 GPU、断网即死 |
-| Termux + X11 | 一个 shell、少量 GUI | 没有合成器、软件渲染、几乎没有窗口管理 |
-| 厂商"桌面模式"（DeX 之类） | 顺滑的 Android 窗口 | 闭源、不是 Linux、没有 `pacman` |
-| 云游戏 / 云 Linux | 省事 | 不是你的机器、不离线、不免费 |
+| PC 模拟器（QEMU/TCG） | x86 翻译成 ARM | 软件，SwiftShader |
+| Termux + X11 | 原生 | `llvmpipe` |
+| 远程桌面 | 远端 | 本地不渲染 |
+| ARCH DESK | 原生 aarch64 | Mali GPU 上的 Vulkan |
 
-ARCH DESK 的赌注很简单：**平板本身就可以是那台电脑** —— 前提是能在 Android 旁边跑一个带 GPU
-加速、能共享硬件的真 Wayland 会话。有 root 这件事很容易；但大多数人手上的设备没有 root，所以
-真正有工程价值的部分是"没有 root 也做到"。
+开发机是联发科 MT8799（8 核、16 GB），guest 跑的是原生指令。PRoot 只在用户态改写与路径有关的
+系统调用，别的什么都不做，所以 `gcc`、`pacman`、视频解码都是 SoC 的真实速度。
 
-## 它是怎么工作的
+需要重建的只有图形。Android 不会给容器一个 DRM 节点，Mali 的内核驱动也没有按 Linux 桌面的方式
+暴露出来，所以这条路绕到 Vulkan 上。
 
-### 两半
+### Mali GPU 是怎么用上的
 
-```
-┌─────────────────────────── Android App（Kotlin/Compose）───────────────────────────┐
-│  前端（Compose）          会话服务                    原生侧（C / NDK）             │
-│  ├ 安装 / 自检 / 修复      ├ PRoot 监管                ├ waylandcomp（合成器）        │
-│  ├ 设置 / 画中画           ├ Venus vtest server  ◄──────── wl socket ──────────┐    │
-│  └ 启动会话                ├ PulseAudio          ◄──────── pulse socket ───┐   │    │
-│                            └ 输入 / 指针捕获                              │   │    │
-│                                     │                                     │   │    │
-│                                     ▼                                     │   │    │
-│                           Android Surface ──► SurfaceFlinger ──► 屏幕    │   │    │
-└───────────────────────────────────────────────────────────────────────────┼───┼────┘
-                                                                            │   │
-┌──────────────────────────── Arch Linux ARM（PRoot）───────────────────────┼───┼────┐
-│  niri（Wayland 合成器）◄── wayland client ─────────────────────────────────┘   │    │
-│  ├─ DankMaterialShell（dms + quickshell/Qt6）                                  │    │
-│  ├─ 应用（Chromium、VLC、LibreOffice、终端……）◄── audio ──────────────────────┘    │
-│  └─ pacman、无 systemd 的服务脚本                                                  │
-└────────────────────────────────────────────────────────────────────────────────────┘
-```
+1. guest 里装一个讲 Venus 协议的 Vulkan ICD（`vulkan-virtio` 提供的
+   `/usr/share/vulkan/icd.d/virtio_icd.json`，用 `VK_ICD_FILENAMES` 选中），Vulkan 调用被序列化
+   成 Venus 协议。
+2. 这个驱动连的是 App 私有目录里的 `files/venus/vtest.sock`，不涉及任何 `/dev` 节点。
+3. APK 自带 `libvirgl_test_server.so`，从自己的 `nativeLibraryDir` 在 App 进程里启动。放在进程里
+   是为了让它扛住 App 覆盖安装。
+4. server 解码 Venus 命令后调用平板真实的 Vulkan 驱动，活儿落到 GPU 上。
+5. 渲染结果以 dmabuf 文件描述符回传，guest 导入成 EGL image，不经过 CPU 内存。
+6. Mesa 的 EGL 打过补丁，会选中 `zink` 并让 kopper 自建 `VkSwapchain`。帧以 dmabuf 进宿主合成器，
+   再进 Android surface。
 
-guest 以为自己连的是一个普通 Wayland 合成器、一个普通 PulseAudio、一套普通 D-Bus 服务。
-它确实连的是，只不过这些东西住在 Android 进程里。
+第 6 步决定桌面能不能用。没有这个补丁，Mesa 判定没有 DRM、没有 Wayland 缓冲路径，加载 `swrast`，
+每帧经 `wl_shm` 拷一遍。3K 屏上的表现就是黑窗口加个位数帧率，GPU 全程闲着。
 
-### 渲染链路
+在 guest 里可以确认实际走的是哪条路：
 
-guest 里既没有 DRM 设备，也没有 `/dev/dri` 渲染节点；Mali 的内核驱动也没有按 Linux 桌面的方式暴露
-给用户态。所以整条链路围绕 Vulkan 重建：
-
-```
-GL 应用 ──► Mesa zink ──► Vulkan ──► Venus（virtio-gpu）──► vtest socket
-                                                              │
-                   Android：libvirgl_render_server ──► Mali-G925 ──► dmabuf
-                                                              │
-                        waylandcomp 取走 dmabuf ──► Android Surface ──► 屏幕
+```console
+$ glmark2 -b build
+GL_RENDERER: zink Vulkan 1.3(Virtio-GPU Venus (Mali-G925-Immortalis MC12))
 ```
 
-其中两个细节比其它所有细节都重要：
-
-**kopper。** Mesa 在 Wayland 上的 EGL 通常需要 DRM 渲染节点或 `wl_drm` 来分配缓冲。这两样我们都
-没有，于是上游 Mesa 判定驱动不可用、退回 `swrast`，整个会话变成把每一帧经 `wl_shm` 拷一遍 ——
-在这台机器上的表现就是黑帧和个位数帧率。解决办法是让 Mesa 选中 `zink`，再由 **kopper** 自建
-`VkSwapchain`，缓冲以 dmabuf 形式流转、完全不碰 CPU。落地方式是给 `libEGL_mesa.so.0.0.0` 打两条
-指令的补丁，外加一个符号链接修正；随机时分发、被 `pacman` 覆盖后由修复工具重新打上。
-
-**两套 EGL 人格。** niri 需要打过补丁（GPU）的 EGL。DMS 是 Qt/quickshell 应用，llvmpipe 跑得很
-正常；让它和 niri 共用同一个 Venus 客户端会让两边一起段错误。所以运行时在 `/opt/egl-orig` 保留
-一份原版，由监督脚本在**清洗过的环境**里用它启动 DMS —— 必须 `env -u` 掉
-`MESA_LOADER_DRIVER_OVERRIDE`、`GALLIUM_DRIVER`、`VK_ICD_FILENAMES` 这些变量，光它们就足以把 Qt
-拽回 Venus。
-
-### 输入
-
-这里的触摸不是触控板。手指落在哪儿，指针就到哪儿并在那儿按下 —— 这是平板上的直觉行为，也是 3K 屏
-上唯一不会"看不见光标"的行为。外接鼠标是另一条路：App 申请**指针捕获**，拿到原始相对位移，再作为
-相对移动 + 按键 + 滚轮送进 guest。两条路最终汇进同一个合成器指针。
-
-### 音频
-
-PulseAudio 跑在 Android App 进程里（`libpulseaudio.so`），其中一个 sink 模块直接写进 `AudioTrack`。
-guest 通过 Unix socket 看到一个正常的 PulseAudio 服务；sink 名为 `DirectAudio`，麦克风名为
-`DirectAudioMic`（pipe source，由 App 的录音器喂数据）。Android 音量键、权限、guest 混音器三者保持
-一致。
-
-### 系统服务
-
-DMS 通过 D-Bus 跟系统打交道：网络面板找 `org.freedesktop.NetworkManager`，蓝牙找 `org.bluez`。
-PRoot 用户空间里没有这两个服务。运行时没有去移植它们，而是装了两个小替身（`dd-nmmock`、
-`dd-bluez`）占住总线名，用 Android 真实状态回答 —— 当前 SSID、地址、网关、信号、适配器、已配对
-设备。这是"桥"而不是"模拟器"：它只汇报，不负责连接。
-
-### Provisioning
-
-默认安装路径下载**官方** `ArchLinuxARM-aarch64-latest.tar.gz`，解开，首次启动跑
-`archdesk-provision`。这个脚本修掉官方 ARM 包在容器里必然出问题的地方（`nsswitch.conf` 里的
-`resolve` 让 DNS 全线失败、`/etc/resolv.conf` 是悬空符号链接、`pacman.conf` 指向一个不存在的仓库），
-装上桌面需要的 34 个顶层包（实际解析出约 400 个包），塞进没有 Arch 包的部分（`dms`、打过补丁的
-EGL、几座桥），最后落一个完成标记。
-
-这样做是为了可维护性：guest 是一套滚动的 Arch 系统，`pacman -Syu` 一直可用，用户可以自己装软件，
-而不是被冻在一张手工镜像里。
-
-## 这个仓库里有什么
-
-| 文件 | 用途 |
-| --- | --- |
-| [`linuxfs-arch-official.json`](linuxfs-arch-official.json) | 默认 catalog：官方 Arch Linux ARM 包 + provision |
-| [`linuxfs-arch.json`](linuxfs-arch.json) | 备用 catalog：1.76 GB 预构建运行时，开箱即用 |
-| [`docs/rendering.md`](docs/rendering.md) | 为什么需要 kopper、为什么两套 EGL、怎么证明真的在跑 GPU |
-| [`docs/runtime-layout.md`](docs/runtime-layout.md) | 目录导览，以及一次会话的启动顺序 |
-| [`docs/publishing.md`](docs/publishing.md) | 打包、发版、更新 catalog、回滚 |
-| [`CHANGELOG.md`](CHANGELOG.md) | 变更记录 |
-
-### catalog 格式
-
-App 读 `BuildConfig.LINUXFS_CATALOG`，期望这样的 JSON：
-
-```json
-{
-  "version": "2026.11-stock",
-  "kind": "official",
-  "format": "tar.gz",
-  "url": "https://mirrors.aliyun.com/archlinuxarm/os/ArchLinuxARM-aarch64-latest.tar.gz",
-  "size": 829367415
-}
-```
-
-| 字段 | 含义 |
-| --- | --- |
-| `version` | 人类可读版本，约定 `YYYY.MM`；App 用它判断"装的是不是这个版本" |
-| `kind` | `official`（官方包 + provision）或 `rootfs`（预构建镜像） |
-| `format` | `tar.gz` 或 `tar.zst`，同时决定解压器 |
-| `url` | 可匿名下载的直链 |
-| `sha256` | `official` 可省略，`rootfs` 必填 |
-| `size` | 字节数，用于进度与磁盘空间判断 |
-
-### Release 资产
-
-- `linuxfs-arch-2026.11.tar.zst` —— 1.76 GB 预构建运行时（解压 4.75 GB），zstd 压缩。
-- provision 相关脚本随 APK 分发、不放在这里，这样它们永远和 App 版本匹配。
+这一行里出现 `llvmpipe` 或 `softpipe` 就说明补丁没生效，自检页对应的项是 `egl-patched`。
 
 ## 安装
 
-1. 装上 ARCH DESK 的 APK（arm64）。
-2. 按提示给通知权限、"安装未知应用"；被问到时给麦克风与定位权限 —— 前者决定有没有 `DirectAudioMic`，
-   后者决定 Wi-Fi 详情能不能显示。
-3. 打开 App，点**打开桌面**。运行时会下载、校验、解包并自动 provision。
-4. 桌面出现。之后如果开了"启动时进入桌面"，下次打开就直接进。
+| 东西 | 链接 |
+| --- | --- |
+| APK（arm64） | [ARCHDESK-debug.apk](https://github.com/MarkisLin/ARCH-DESK/releases/download/app-2026.11.13/ARCHDESK-debug.apk) |
+| 官方源 catalog（默认） | [`linuxfs-arch-official.json`](linuxfs-arch-official.json) |
+| 预构建运行时 1.76 GB（可选） | [release `linuxfs-2026.11`](https://github.com/MarkisLin/ARCH-DESK/releases/tag/linuxfs-2026.11) |
+
+APK 用测试证书签名、标了 debuggable，因为平板上跑的就是这一版。目前没有商店上架，也没有更新通道。
+
+1. 装 APK，打开。
+2. 按提示给通知、麦克风、定位权限。麦克风决定有没有 `DirectAudioMic`，定位决定 Wi-Fi 面板能不能
+   显示详情。
+3. 点「打开桌面」。App 会下载官方 Arch Linux ARM 压缩包、解开，首次启动时自动配置。
+4. 如果开了"启动时进入桌面"，之后打开 App 就直接进桌面。
 
 | | 官方源（默认） | 预构建 |
 | --- | --- | --- |
 | 下载 | 约 830 MB | 1.76 GB |
-| 首次安装 | 10–20 分钟（取决于网速） | 2–4 分钟 |
-| 能否直接 `pacman` 滚动 | 可以，立刻 | 可以，首次 `pacman -Syu` 之后 |
-| 配好之后离线可用 | 是 | 是 |
+| 首次安装 | 10–20 分钟，取决于网速 | 2–4 分钟 |
+| 能否立刻 `pacman -Syu` | 可以 | 首次升级之后可以 |
+| 配好之后离线可用 | 可以 | 可以 |
 
-需要约 6 GB 空闲空间。下载支持断点续传；在发布 `sha256` 时，App 会在动到已装系统之前先校验大小与哈希。
+需要约 6 GB 空闲空间。下载支持断点续传；catalog 里给了 sha256 时，App 在动已装的系统之前会先
+校验大小和哈希。
 
-### 自检与修复
+左侧栏有两个工具。自检覆盖三十项左右，其中只有会话运行期间才成立的项，在桌面没跑时报 `SKIP`
+而不是失败。修复是幂等的：重新 stage 随包脚本、还原 EGL 补丁和符号链接、重写 `/etc/os-release`、
+补回 `pactl` 包装、重打桌面的音频补丁、重启两个 D-Bus 服务。没有会话在跑时，它会用画中画把桌面
+拉起来干完活再收起来。
 
-都在 App 左侧栏。自检约三十项：二进制、随包脚本、EGL 补丁哈希、Venus socket、niri/DMS/quickshell
-的 socket、PulseAudio 与两个节点、两个 D-Bus 桥、以及 guest 里那份网络快照。只在桌面运行期间才
-成立的项，桌面没跑时会报 `SKIP` 而不是 `FAIL`，所以在闲置的平板上做检查仍然有意义。
+## 桌面上有什么
 
-修复是幂等的：重新 stage 资产、还原 EGL 补丁与符号链接、重写 `/etc/os-release`、补回 `pactl`
-包装、重打 DMS 音频补丁、重启两座桥。如果当时没有会话在跑，它会用**画中画**把桌面拉起来干完活，
-再收起来。
+- **niri** 管窗口。可滚动平铺适合平板：每个窗口占一条满高的列，左右滚动是触屏上本来就有的手势。
+- **DankMaterialShell** 提供顶栏、Dock、控制中心和设置。它就是个普通 Wayland 客户端，壳崩了不会
+  带走整个会话。
+- **触控**把指针挪到手指的位置并在那里按下。不是触控板；之前那套触控板逻辑会让点击落在指针当时
+  恰好在的地方。
+- **外接鼠标**走指针捕获：App 拿到原始相对位移，把移动、按键、滚轮转发进 guest。两条输入最后都
+  汇到合成器同一个指针上。
+- **声音**来自跑在 App 里的 PulseAudio，sink 直接写进 `AudioTrack`，所以 guest 看到的是
+  `DirectAudio`；麦克风是同一套路子，pipe source 由 App 的录音器喂数据，叫 `DirectAudioMic`。
+- **网络和蓝牙面板**由两个小服务供数据：它们占住 `org.freedesktop.NetworkManager` 和
+  `org.bluez` 的总线名，用 Android 的真实状态回答。只负责描述，不负责连接。
 
 ## 已验证的硬件
 
-| 设备 | SoC / GPU | Android | 结果 |
+| 设备 | SoC / GPU | Android | 情况 |
 | --- | --- | --- | --- |
-| Redmi K Pad（`25079RPDCC`） | 联发科 MT8799 / Mali-G925-Immortalis MC12 | 16 | 日常可用：niri + DMS、Chromium、VLC、终端、音频输入输出、鼠标 + 触控 |
+| Redmi K Pad（`25079RPDCC`） | 联发科 MT8799 / Mali-G925-Immortalis MC12 | 16 | 日常使用：niri + 桌面壳、Chromium、VLC、终端、声音输入输出、鼠标和触控 |
 
-其它设备没有测过。有风险的假设是三条：Vulkan 驱动能接受 Venus；GPU 能导出 dmabuf；有 4 GB 以上
-空闲空间。没有可用 Vulkan ICD 的设备会退回软件渲染，慢到不可用。
+别的设备没试过。可能在其它机器上不成立的假设有三个：Vulkan 驱动接受 Venus、GPU 能导出 dmabuf、
+有 4 GB 以上空闲空间。没有可用 Vulkan ICD 的机器会掉回软件渲染。
 
 ## 设计取舍
 
-**用 PRoot，不用 chroot。** 零售设备拿不到 root，解 BL 要付出保修、Play Integrity，有时还有相机。
-PRoot 在用户态拦截路径解析类系统调用，不需要任何特权。代价是真实的：没有 namespace、没有 `mount`、
-没有真 `/proc`、没有 `setuid`。
-
-**用 niri，不用浮动窗口合成器。** 平板是一块没有键盘、没有鼠标的矩形。可滚动平铺给每个窗口一条
-可预测的满高列，手势天然映射成横向滚动，也没有需要用手指去够的窗口边框按钮。
-
-**用 DankMaterialShell，不自己写壳。** quickshell 直接给出一套成熟的顶栏、Dock、控制中心与设置界面，
-QML 迭代很快。附带好处是壳就是个普通 Wayland 客户端，壳崩了不会带走整个会话。
-
-**改 EGL，不改 Mesa。** 在设备上为 aarch64 重编 Mesa 又慢又脆；给 EGL 加载器打两条指令补丁、再用
-一个包装脚本在 `pacman` 升级后补回去，运行时零成本。
-
-**做桥，不做服务。** 在容器里塞一个完整 NetworkManager 或 BlueZ，意味着 netlink、D-Bus 策略、内核
-模块，这些 PRoot 给不了。用同样的总线名汇报 Android 的状态，能拿到 95% 的可见价值，只花 5% 的成本
-—— 而且它对"做不到什么"是诚实的：它不负责连网，只描述 Android 已经连上的那个网。
-
-**官方包 + provision，不做冻结镜像。** 冻结镜像好发、难养。provision 让 `pacman` 保持有用，让用户
-能自己装软件，也让版本之间的差异变小。
+- **用 PRoot，不用 chroot。** 零售设备没有 root，解 BL 要拿保修、Play Integrity 甚至相机去换。
+  代价是没有 namespace、没有 `mount`、没有真 `/proc`、没有 `setuid`。
+- **改 EGL 加载器，不重编 Mesa。** 两条指令的改动，加一个在 `pacman` 升级后补回去的包装脚本。
+  在设备上为 aarch64 编 Mesa 又慢又容易在下一个版本上散架。
+- **两套 EGL。** niri 用打过补丁、走 GPU 的那份；桌面壳在 llvmpipe 上用 `/opt/egl-orig` 里的原版，
+  环境变量也要清干净，因为两边共用一个 Venus 客户端会一起段错误。
+- **官方包加配置脚本，不做冻结镜像。** 冻结镜像好发布、难维护。用配置脚本能让 `pacman` 继续可用，
+  用户可以自己装软件，系统也能继续吃到上游修复。
+- **做桥，不移植 NetworkManager 和 BlueZ。** 这两个都要 netlink、D-Bus 策略和内核模块，PRoot 给
+  不了。用同样的总线名汇报 Android 的状态，已经够面板显示。
 
 ## 已知不足
 
-这些不是待办清单，而是当前设计的形状。
+- **没有沙箱。** PRoot 不创建 namespace，`bwrap`、Chromium 的 zygote 沙箱、QtWebEngine 的沙箱都
+  无法工作。运行时带了一个 `bwrap` 垫片，启动包装器会传 `--no-sandbox`；安全边界是 Android 的
+  应用沙箱。
+- **GPU 是间接的。** 没有 `/dev/dri` 渲染节点，需要 GBM 或探测 DRM 的程序会失败。所有渲染走
+  Vulkan。
+- **没有 systemd。** 服务就是被会话看管的脚本，没有 timer、没有 socket 激活、没有依赖排序。
+- **后台受 Android 管。** 内存紧张时会话可能被杀；后台 UID 没有网络，所以安装过程必须挂着前台
+  通知。
+- **面板只能看。** 能显示当前网络和已配对蓝牙设备，不能扫描新网络、不能配对新设备。
+- **单 sink、单 source。** 没有按应用分流，没有 HDMI，没有多麦克风。
+- **嵌套呈现。** guest 渲染到一个 surface，Android 再合成一次，每帧有一点固定开销，也没有 HDR。
+- **EGL 补丁要养。** 它绑在某个 Mesa 大版本的加载器布局上。跨度大的 `pacman -Syu` 会让它失效，
+  自检会发现、修复工具会把文件补回去，但补丁本身迟早要重新推导。
+- **只测过一个 SoC。** 全部开发对着 Mali 做，Adreno 没试过。
+- **LibreOffice 还起不来**，退出时打印 `ERROR: /proc not mounted`。
 
-- **没有沙箱。** PRoot 不提供 namespace，所以 `bwrap`、Chromium 的 zygote 沙箱、QtWebEngine 的沙箱
-  都无法工作。运行时带了一个 `bwrap` 兼容垫片，启动包装器会传 `--no-sandbox`；真正的安全边界是
-  Android 的应用沙箱（UID + SELinux）。Electron 系、Chromium 系、任何自带 `chrome-sandbox` 的程序
-  都需要那个开关。
-- **GPU 是间接的。** 没有 DRM 渲染节点。探测 `/dev/dri` 或依赖 GBM 的程序会找不到。所有渲染都走
-  Vulkan/kopper，够快，但不等于原生 Linux GPU 栈。
-- **没有 `systemd`。** 服务就是被会话监管的普通脚本。没有 timer、没有 socket 激活、没有依赖排序；
-  任何假设 `systemctl` 存在的东西都用不了。
-- **后台执行由 Android 决定。** 内存吃紧时系统可能杀掉会话；后台 UID 的网络被限制 —— 所以下载必须
-  让 App 在前台，这也是安装器一直挂着前台通知的原因。
-- **硬件面板不完整。** DMS 能显示当前网络与已配对蓝牙设备，但不能扫描新 Wi-Fi、不能配对新设备：
-  这些操作在 Android API 后面，桥还没去调。
-- **单 sink、单 source。** 音频走默认输出；没有按应用分流，没有 HDMI，也没有多麦克风建模。
-- **嵌套呈现。** guest 合成器渲染到一个 `Surface`，再由 Android 合成一次。没有直接扫描输出，所以
-  每帧有一笔固定小开销，也没有 HDR。
-- **补丁要养。** EGL 补丁绑在某个 Mesa 大版本的 `libEGL_mesa` 布局上。一次跨度大的 `pacman -Syu`
-  可能让它失效；自检会发现、修复工具会补回，但补丁本身迟早要重新推导。
-- **只测过一个 SoC。** 全部开发都对着 Mali + Venus 做。Adreno 的 Vulkan 故事不一样，未测。
+## 后续
 
-## 路线图
-
-**近期 —— 让日常使用变得无聊**
-
-- 不依赖前台也能完成 provision（前台服务 + 可续传下载）。
-- 用真正的会话生命周期取代"启动时进桌面"的猜测（配置变更不丢、被低内存杀掉后能恢复）。
-- 把硬件面板做得诚实：能报的报，不支持的置灰，而不是显示一个空列表。
-- 修掉 niri 每秒重建 output 的抖动，以及 LibreOffice 因 `/proc` 起不来的问题。
-
-**中期 —— 让陌生人也能装上**
-
-- 把 `dms`、quickshell 和补丁做成真正的 `pacman` 包，放在签名仓库里，让 `pacman -Syu` 也能更新桌面。
-- 公开 App 源码、签名产物与可复现打包流程；再验证第二台设备。
-- 官方源与预构建之间可迁移，并支持回滚到上一个 rootfs。
-- 结构化桥：在宿主侧调 `WifiManager`/`BluetoothAdapter`，给 guest 一个小的强类型接口，而不是长期
-  维护 D-Bus 替身。
-
-**远期 —— 这个东西的形态**
-
-- guest 里有一个真正的 init（runit/s6 风格），服务是声明出来的，不是手工看护的。
-- 零拷贝呈现：dmabuf 直接进 Android 合成器，帧节奏跟着屏幕 vsync。
-- 外接显示器、硬件键盘、触控板作为一等输入。
-- 在平台允许的地方走真正的隔离（容器或虚拟机），PRoot 作为通用回退。
+- 不依赖前台也能完成配置。
+- 把 `dms`、quickshell 和补丁做成签名仓库里的 `pacman` 包，让桌面跟着系统一起更新。
+- 公开 App 源码，发一个用正式证书签名的版本。
+- 把硬件面板补完，或者干脆把做不到的部分藏起来，而不是显示空列表。
+- 修掉 LibreOffice 的 `/proc` 问题和 niri 每秒重建 output 的抖动。
+- 更远一点：guest 里有一个真正的 init、零拷贝呈现、外接显示器和键盘、以及在平台允许时走容器或
+  虚拟机。
 
 ## 仓库结构
 
 ```
 .
-├── README.md                   英文版
+├── README.md                   英文
 ├── README.zh-CN.md             本文件
-├── linuxfs-arch-official.json  默认 catalog（官方包 + provision）
-├── linuxfs-arch.json           备用 catalog（预构建运行时）
+├── linuxfs-arch-official.json  默认 catalog：官方包 + 配置脚本
+├── linuxfs-arch.json           备用 catalog：预构建运行时
 ├── docs/
-│   ├── rendering.md            渲染管线、kopper、如何验证 GPU
+│   ├── rendering.md            渲染管线、kopper、怎么确认真的在用 GPU
 │   ├── runtime-layout.md       文件在哪、会话启动顺序
 │   └── publishing.md           打包、发版、回滚
 └── CHANGELOG.md
 ```
 
-本仓库只承载产物与清单，不放应用源码。App、原生合成器与打包脚本在应用仓库（`linuxdesk/`）里，
-包括 `tools/package-linuxfs.sh` 与 `tools/provision/`。
+catalog 字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `version` | `YYYY.MM`，跟已装版本比对 |
+| `kind` | `official`（官方包 + 配置）或 `rootfs`（预构建） |
+| `format` | `tar.gz` 或 `tar.zst` |
+| `url` | 直接下载地址 |
+| `sha256` | `official` 可省，`rootfs` 必填 |
+| `size` | 字节数 |
+
+## 出处
+
+这个项目是从 [DroidDeck](https://github.com/Droid-Deck/DroidDeck) 0.6.9 fork 出来的。DroidDeck 做的是
+在 Android 上跑 Steam Gaming Mode，渲染思路来自那里：把 Wayland 合成器放进 App 里、把 guest 的
+surface 呈现到 Android surface；用 Venus/virgl 桥把 Vulkan 经 socket 交给厂商驱动；以及
+`files/linuxfs` 下那套 proot 会话布局。ARCH DESK 保留了包名和 `droiddeck-*` 脚本名，这样已经装好的
+用户可以原地升级。
+
+为了从游戏壳改成桌面，改动了这些地方：会话从 gamescope 换成 niri + DankMaterialShell；EGL 加载器
+打了 kopper 补丁，桌面壳改用另一份原版 EGL；触控从触控板改成绝对指针；重写了指针捕获，让鼠标真的
+能推动 guest 里的指针；网络和蓝牙面板改成由 Android 供数据；运行时改成从官方包安装并跑配置脚本；
+App 里加了自检和修复。
+
+其余都是别人的东西：Arch Linux ARM、niri、DankMaterialShell 与 quickshell、Mesa、virglrenderer 与
+Venus 协议，以及它们依赖的包。
 
 ## 许可
 
-运行时内是 Arch Linux ARM 及其上游项目的软件，各包遵循各自许可证。本仓库的脚本、清单与文档计划
-以 MIT 发布 —— 正式的 `LICENSE` 文件还没落地，所以这段文字代表意图，还不是法律文本。
+运行时里的包各自遵循上游许可证。本仓库的脚本、catalog 和文档打算用 MIT，`LICENSE` 文件还没放进来，
+所以这句话目前只是意图，不是授权。
