@@ -199,7 +199,7 @@ There is no store listing and no update channel yet.
 Around 6 GB of free space is needed. Downloads resume if interrupted, and the app checks the size
 (and the SHA-256, when the catalog publishes one) before touching an existing installation.
 
-Two tools sit in the left rail. The check covers about thirty items; items that only exist while a
+Three tools sit in the left rail: the store, the setup page and the check page. The check covers about thirty items; items that only exist while a
 session is running are reported as `SKIP` when the desktop is stopped, instead of failing. Repair is
 idempotent: it restages the shipped scripts, restores the EGL patch and its symlinks, rewrites
 `/etc/os-release`, reinstalls the `pactl` wrapper, re-applies the shell's audio patch and restarts the
@@ -223,6 +223,18 @@ dismisses it.
 - **Network and Bluetooth panels** are fed by two small services that hold the
   `org.freedesktop.NetworkManager` and `org.bluez` bus names and answer with what Android reports.
   They describe; they do not connect.
+
+## Apps and updates
+
+The app carries a catalogue of about ninety packages (`store.json`), sorted into eight categories,
+with a short description in Chinese and English for each. Installing from it runs `pacman -S` inside
+a fake-root proot, so the package lands in the same root filesystem the desktop boots from; once the
+package writes its `.desktop` file it shows up in the launcher. Packages outside the catalogue are
+still one `pacman` command away in a terminal.
+
+System upgrades live on the check page: it counts `pacman -Qu` when the page opens and runs
+`pacman -Syu` on demand, streaming the output into the card. DMS has its own software-update page,
+but it calls `pkexec`, which needs a real setuid binary and polkit — that page cannot work here.
 
 ## Verified hardware
 
