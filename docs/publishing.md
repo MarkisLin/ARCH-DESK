@@ -40,7 +40,7 @@ tar --zstd -tf dist/linuxfs-arch-2026.12.tar.zst | head
 
 ```bash
 TOKEN=...                       # 不要写进脚本、不要提交
-REPO=MarkisLin/linuxdesk-components
+REPO=MarkisLin/ARCH-DESK
 TAG=linuxfs-2026.12
 
 curl -sS --ssl-no-revoke -X POST \
