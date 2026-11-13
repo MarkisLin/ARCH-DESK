@@ -15,7 +15,7 @@ tools/package-linuxfs.sh \
   --root /path/to/arch-rootfs \
   --version 2026.12 \
   --out dist/ \
-  --base-url https://github.com/MarkisLin/linuxdesk-components/releases/download/linuxfs-2026.12
+  --base-url https://github.com/MarkisLin/ARCH-DESK/releases/download/linuxfs-2026.12
 ```
 
 脚本行为：
@@ -71,7 +71,7 @@ git commit -m "linuxfs 2026.12"
 git push origin main
 ```
 
-App 只认 `https://raw.githubusercontent.com/MarkisLin/linuxdesk-components/main/linuxfs-arch.json`，
+App 只认 `https://raw.githubusercontent.com/MarkisLin/ARCH-DESK/main/linuxfs-arch.json`，
 推送后下次启动就会看到新版本。要临时指向别的 catalog，编译时加
 `-PdroiddeckCatalog=<url>`（对应 `BuildConfig.LINUXFS_CATALOG`）。
 

@@ -1,190 +1,346 @@
-# LinuxDesk Components
+# ARCH DESK
 
-LinuxDesk 在 Android 平板上跑 Arch Linux ARM 桌面所需的**预构建运行时**（rootfs）与 **catalog 清单**。
+**A real Arch Linux ARM desktop — niri + DankMaterialShell — running on an Android tablet.
+No root. No unlocked bootloader. No virtual machine.**
 
-这个仓库只放"大块头、变化慢、需要单独下载"的东西：一个定制好的 Arch Linux ARM 根文件系统。
-App（`com.dsh.linuxdesk`）本身不携带 rootfs，首次启动时按 `linuxfs-arch.json` 下载一次，
-校验大小与 SHA-256 后解压到 `files/linuxfs`，之后完全离线运行。
-
-- 不需要 root，不需要解锁 Bootloader
-- 桌面是真正的 Wayland 合成器（niri）+ 完整 Arch 用户空间，不是套壳终端
-- 渲染走 GPU：Mesa EGL（kopper 补丁）+ Venus/virgl 把 Vulkan 转发到 Android 的 Mali 驱动
+English | [简体中文](README.zh-CN.md)
 
 ---
 
-## 当前组件
+ARCH DESK turns an ordinary Android tablet into a Linux workstation. The user space is a genuine
+Arch Linux ARM aarch64 installation: `pacman`, the rolling release, system libraries, the whole
+thing. The desktop is a genuine Wayland session: niri as the compositor, DankMaterialShell (DMS)
+as the shell, applications rendering through the tablet's own GPU.
 
-| 组件 | 版本 | 压缩后 | 解压后 | 内容 |
-| --- | --- | --- | --- | --- |
-| `linuxfs-arch` | 2026.11 | 1.76 GB | 4.75 GB | 定制 Arch Linux ARM aarch64 rootfs：niri + DankMaterialShell 桌面、Mesa kopper 补丁、Venus 渲染通路，以及全部桥接脚本 |
+Nothing is emulated and nothing is streamed. The only Android-specific pieces are the transport
+between the two worlds: a Wayland compositor that presents the guest session into an Android
+`Surface`, a Vulkan bridge that hands GPU work to the vendor driver, and a small set of bridges so
+the desktop can see the hardware Android owns (audio, network, Bluetooth, input).
 
-下载地址与校验值都在 [`linuxfs-arch.json`](linuxfs-arch.json) 里，Release 资产名为
-`linuxfs-arch-2026.11.tar.zst`（zstd 压缩的 tar，`tar --zstd -xf` 即可展开）。
+This repository is the **distribution channel** for that user space: the catalogs the app reads,
+the provisioning recipe that turns a stock Arch Linux ARM tarball into a desktop, and the prebuilt
+runtime for people who would rather skip the first-run setup.
 
-### 两种下载源
+| | |
+| --- | --- |
+| Platform | Android 8.0+ (`arm64-v8a`), validated on Android 16 |
+| Root | **Not required** — the guest runs under PRoot |
+| Desktop | niri 26.04 + DankMaterialShell 2.1 |
+| Graphics | Mesa `zink` → Vulkan (Venus) → Mali-G925, dmabuf presentation |
+| Install size | ~4.8 GB unpacked, ~830 MB – 1.76 GB download |
+| First run | 10–20 min on a normal connection |
 
-App 默认走**官方源**：catalog 是 [`linuxfs-arch-official.json`](linuxfs-arch-official.json)，
-`kind: "official"`，直接指向 Arch Linux ARM 官方的
-`ArchLinuxARM-aarch64-latest.tar.gz`（约 830 MB）。下载解包后，第一次启动桌面时由
-`archdesk-provision` 用 pacman 装上 niri / quickshell / Mesa / Qt6 等 34 个顶层包（约 400 个包），
-所以系统可以跟着 Arch 仓库滚动更新，不需要换整个镜像。
+---
 
-想省掉首次配置、拿一个"开箱即用"的成品根文件系统时，改用 `linuxfs-arch.json`
-（`kind: "rootfs"`，1.76 GB 整包）。构建时可以覆盖：
+## Table of contents
 
-```bash
-./gradlew assembleDebug -PdroiddeckCatalog=https://raw.githubusercontent.com/MarkisLin/linuxdesk-components/main/linuxfs-arch.json
+- [Why this exists](#why-this-exists)
+- [How it works](#how-it-works)
+- [What is in this repository](#what-is-in-this-repository)
+- [Installing](#installing)
+- [Verified hardware](#verified-hardware)
+- [Design decisions](#design-decisions)
+- [Known limitations](#known-limitations)
+- [Roadmap](#roadmap)
+- [Repository layout](#repository-layout)
+- [License](#license)
+
+---
+
+## Why this exists
+
+A modern tablet has more compute than the laptop most people browse the web on: eight cores, a
+recent GPU, 8–16 GB of RAM, a 3K display, and a battery that lasts a day. Android gives all of that
+to a phone UI. The existing escape hatches are unsatisfying:
+
+| Approach | What it gives you | What it does not |
+| --- | --- | --- |
+| SSH / VNC into a remote machine | A real desktop | Needs a network, adds latency, uses no local GPU, dies without Wi-Fi |
+| Termux + X11 | A shell, some GUI apps | No compositor, software rendering, no window management worth the name |
+| Vendor "desktop mode" (DeX and friends) | Polished Android windows | Closed, not Linux, no `pacman` |
+| Cloud gaming / remote Linux | Convenience | Not your machine, not offline, not free |
+
+ARCH DESK's bet is simpler: **the tablet can be the computer**, if a real Wayland session can run
+next to Android with GPU acceleration and shared hardware. Root would make that easy; root is not
+available on most devices people actually own, so the interesting engineering is doing it without.
+
+## How it works
+
+### The two halves
+
+```
+┌─────────────────────────── Android app (Kotlin/Compose) ───────────────────────────┐
+│  Front end (Compose)      Session service            Native side (C / NDK)         │
+│  ├ install / self-check   ├ PRoot supervisor         ├ waylandcomp  (compositor)   │
+│  ├ settings               ├ Venus vtest server  ◄──────── wl_socket ───────────┐   │
+│  └ picture-in-picture     ├ PulseAudio          ◄──────── pulse socket ────┐   │   │
+│                           └ input / pointer capture                       │   │   │
+│                                    │                                      │   │   │
+│                                    ▼                                      │   │   │
+│                          Android Surface ──► SurfaceFlinger ──► panel    │   │   │
+└───────────────────────────────────────────────────────────────────────────┼───┼───┘
+                                                                            │   │
+┌──────────────────────────── Arch Linux ARM (PRoot) ───────────────────────┼───┼───┐
+│  niri (Wayland compositor)  ◄── wayland client ───────────────────────────┘   │   │
+│  ├─ DankMaterialShell (dms + quickshell/Qt6)                                  │   │
+│  ├─ applications (Chromium, VLC, LibreOffice, terminals, …)  ◄── audio ───────┘   │
+│  └─ pacman, systemd-free service scripts                                          │
+└───────────────────────────────────────────────────────────────────────────────────┘
 ```
 
----
+The guest believes it is talking to a normal Wayland compositor, a normal PulseAudio server and a
+normal set of D-Bus services. It is; they just happen to live in the Android process.
 
-## 这个运行时里有什么
+### The rendering chain
 
-### 桌面
+There is no DRM device and no `/dev/dri` render node for the guest, and the Mali kernel driver is
+not exposed to user space the way a Linux desktop expects. So the chain is rebuilt around Vulkan:
 
-- **niri 26.04** — 滚动平铺式 Wayland 合成器，平板手势与触控的落点就是指针落点
-- **DankMaterialShell（DMS）** — `dms`（Go 二进制）+ `qs`（quickshell/Qt6）组成的顶栏、Dock、控制中心、设置面板
-- **会话入口** — `/usr/bin/startlxqtwayland`（名字是历史遗留）：准备 GPU 环境、修补 Mesa EGL、拉起 DMS 监督进程，最后 `exec niri`
+```
+GL app ──► Mesa zink ──► Vulkan ──► Venus (virtio-gpu) ──► vtest socket
+                                                              │
+                       Android: libvirgl_render_server ──► Mali-G925 ──► dmabuf
+                                                              │
+                            waylandcomp takes the dmabuf ──► Android Surface ──► screen
+```
 
-### 图形栈
+Two details matter more than the rest:
 
-| 层 | 实现 | 说明 |
-| --- | --- | --- |
-| Vulkan | `libvulkan_virtio.so` + Venus | guest 侧把 Vulkan 命令流交给 Android 侧的 `libvirgl_test_server.so`，最终落到 Mali-G925 |
-| OpenGL | Mesa `zink` → Vulkan | 没有原生 GL 驱动，GL 全部经 zink 走 Vulkan |
-| EGL 呈现 | **kopper 补丁的 `libEGL_mesa.so.0.0.0`** | 让 zink 自建 VkSwapchain 走 dmabuf，绕开旧路径的 `wl_shm` 拷贝（那是黑屏与掉帧的根源） |
-| 原版 EGL | `libEGL_mesa.so.0.0.0.orig` + `/opt/egl-orig/` | DMS 用原版（llvmpipe）启动，避免和 niri 抢同一个 Venus 客户端 |
+**kopper.** Mesa's EGL on Wayland normally wants a DRM render node or `wl_drm` to hand out buffers.
+We have neither, so upstream Mesa decides the driver cannot work, falls back to `swrast`, and the
+session ends up copying every frame through `wl_shm` — which on this hardware means black frames
+and single-digit frame rates. The fix is to make Mesa pick `zink` and let **kopper** build its own
+`VkSwapchain`, so buffers travel as dmabufs and never touch the CPU. That is a two-instruction patch
+to `libEGL_mesa.so.0.0.0` plus a symbol-link fix, shipped inside the runtime and re-applied by the
+repair tool if a `pacman` upgrade overwrites it.
 
-kopper 补丁版 md5：`474a1a62a4faeb80f208d97329f7ce75`。
+**Two EGL personalities.** niri needs the patched (GPU) EGL. DMS is a Qt/quickshell application that
+is perfectly happy on llvmpipe, and pointing it at the same Venus client as niri makes both
+segfault. So the runtime keeps a pristine copy at `/opt/egl-orig` and the supervisor launches DMS
+against it, in a scrubbed environment (`env -u` on `MESA_LOADER_DRIVER_OVERRIDE`, `GALLIUM_DRIVER`,
+`VK_ICD_FILENAMES`, …), because those variables alone are enough to drag Qt back onto Venus.
 
-### 桥接脚本（`/usr/local/bin`）
+### Input
 
-| 脚本 | 作用 |
+Touch is not a trackpad here. Tapping the screen puts the pointer where the finger landed and
+presses there — the intuitive behaviour on a tablet, and the only one that survives a 3K panel
+without a cursor you cannot see. A physical mouse is a different path: the app requests **pointer
+capture**, receives raw relative deltas, and forwards them into the guest as relative motion plus
+buttons and wheel. Both end up in the same compositor pointer.
+
+### Audio
+
+PulseAudio runs inside the Android app (`libpulseaudio.so`), with a sink module that writes straight
+into an `AudioTrack`. The guest sees a normal PulseAudio server over a Unix socket; the sink appears
+as `DirectAudio` and the microphone as `DirectAudioMic` (a pipe source fed by the app's recorder).
+Android's volume keys, the app's permissions and the guest's mixer stay in sync.
+
+### System services
+
+DMS talks to the system over D-Bus: `org.freedesktop.NetworkManager` for the network panel,
+`org.bluez` for Bluetooth. Neither service exists in a PRoot user space. Rather than porting them,
+the runtime ships two small stand-ins (`dd-nmmock`, `dd-bluez`) that own those bus names and answer
+with the state Android actually has — current SSID, address, gateway, signal, adapter, paired
+devices. It is a bridge, not an emulator: it reports, it does not connect.
+
+### Provisioning
+
+The default install path downloads the **official** `ArchLinuxARM-aarch64-latest.tar.gz`, unpacks it,
+and runs `archdesk-provision` on first boot. That script fixes what a stock ARM tarball gets wrong
+inside a container (DNS via `nsswitch.conf`, a dangling `/etc/resolv.conf` symlink, a `pacman.conf`
+that points at a repository which does not exist), installs the 34 top-level packages the desktop
+needs (about 400 packages resolved), drops in the pieces that have no Arch package (`dms`, the
+patched EGL, the bridges), and records that it is done.
+
+The point is maintainability: the guest is a rolling Arch system, so `pacman -Syu` keeps working and
+users can install whatever they like, instead of being frozen inside a hand-built image.
+
+## What is in this repository
+
+| File | Purpose |
 | --- | --- |
-| `droiddeck-dms-supervisor` | 等 niri 的 socket → 用干净环境（`env -u` 掉 zink/Venus 变量）拉起 `dms run` → quickshell 掉线就重拉 → 给 DMS 打音频补丁 |
-| `dd-nmmock` / `dd-nmmockd` | 用 python3 + `ctypes` 直接调 libdbus，冒充 `org.freedesktop.NetworkManager`，把手机当前的 Wi-Fi（SSID/IP/网关/信号）喂给 DMS |
-| `dd-bluez` | 冒充 `org.bluez`，把手机蓝牙适配器与已配对设备喂给 DMS |
-| `pactl` | 包装成 `LC_ALL=C /usr/bin/pactl`，否则中文 locale 会让 DMS 的正则匹配不到 sink |
-| `droiddeck-selfcheck` | 27 项运行时自检，逐条 `OK`/`FAIL`，末行 `SUMMARY failed=N` |
-| `droiddeck-repair` | 配套修复：把被 pacman、误删、半途而废的安装弄丢的东西放回去，末行 `SUMMARY fixed=N` |
+| [`linuxfs-arch-official.json`](linuxfs-arch-official.json) | Default catalog: official Arch Linux ARM tarball + provisioning |
+| [`linuxfs-arch.json`](linuxfs-arch.json) | Fallback catalog: prebuilt 1.76 GB runtime, ready on first boot |
+| [`docs/rendering.md`](docs/rendering.md) | Why kopper, why two EGLs, how to prove the GPU is real |
+| [`docs/runtime-layout.md`](docs/runtime-layout.md) | Where everything lives, and the order a session starts in |
+| [`docs/publishing.md`](docs/publishing.md) | Packaging, releases, catalog updates, rollback |
+| [`CHANGELOG.md`](CHANGELOG.md) | What changed, when |
 
-音频由 App 侧的 PulseAudio 提供服务（socket 在 `files/pulseaudio/PS0`），guest 里出现两个节点：
-`DirectAudio`（外放）与 `DirectAudioMic`（麦克风）。
+### Catalogs
 
-### 明确不包含
-
-`/root`、`/home`、`/proc`、`/sys`、`/dev`、`/run`、`/tmp`、`/var/cache/pacman/pkg`、`/var/log`，
-以及 `/data`（Android 侧路径，打包时会递归，必须排除）。
-
----
-
-## catalog 格式
-
-App 通过 `BuildConfig.LINUXFS_CATALOG` 读这个 JSON（默认指向本仓库 `main` 分支的 raw 地址）：
+The app reads `BuildConfig.LINUXFS_CATALOG` and expects:
 
 ```json
 {
-  "version": "2026.11",
-  "url": "https://github.com/MarkisLin/linuxdesk-components/releases/download/linuxfs-2026.11/linuxfs-arch-2026.11.tar.zst",
-  "sha256": "cbf8626df287368796ab7f0b3c90a5ef4ac7a78ce44f4d32f594082f0d2d5d1b",
-  "size": 1759019097
+  "version": "2026.11-stock",
+  "kind": "official",
+  "format": "tar.gz",
+  "url": "https://mirrors.aliyun.com/archlinuxarm/os/ArchLinuxARM-aarch64-latest.tar.gz",
+  "size": 829367415
 }
 ```
 
-| 字段 | 说明 |
+| Field | Meaning |
 | --- | --- |
-| `version` | 人类可读版本，约定 `YYYY.MM`；App 用它判断"装的是不是这个版本" |
-| `url` | 直链，必须能匿名下载（Release 资产即可） |
-| `sha256` | 压缩包（`.tar.zst`）的哈希，下载后校验，不匹配则放弃 |
-| `size` | 字节数，用于显示进度与提前判断磁盘空间 |
+| `version` | Human-readable version, `YYYY.MM`; the app compares it with what is installed |
+| `kind` | `official` (stock tarball + provision) or `rootfs` (prebuilt image) |
+| `format` | `tar.gz` or `tar.zst`; also selects the decompressor |
+| `url` | Direct, anonymous download link |
+| `sha256` | Optional for `official`, mandatory for `rootfs` |
+| `size` | Bytes, for progress and disk-space checks |
 
-App 侧流程：`GET catalog` → 比对本地已装版本 → 下载到 `files/` → 校验 `size`/`sha256` → 解压到 `files/linuxfs` → 跑 `droiddeck-selfcheck`。
+### Release assets
 
----
+- `linuxfs-arch-2026.11.tar.zst` — 1.76 GB prebuilt runtime (4.75 GB unpacked), zstd.
+- Provisioning scripts travel inside the APK, not here, so they always match the app version.
 
-## 开发与发布
+## Installing
 
-### 重新打包 rootfs
+1. Install the ARCH DESK APK (arm64).
+2. Grant notification and "install unknown apps" if prompted; grant microphone and location when
+   asked — the first is required for the microphone node, the second for Wi-Fi details.
+3. Open the app and press **Open desktop**. The runtime downloads, verifies, unpacks and provisions.
+4. The desktop appears. Later launches go straight in, if "start desktop at launch" is enabled.
 
-打包脚本在 App 仓库的 `tools/package-linuxfs.sh`：
+| | Official (default) | Prebuilt |
+| --- | --- | --- |
+| Download | ~830 MB | 1.76 GB |
+| First run | 10–20 min (network-bound) | 2–4 min |
+| Stays updatable with `pacman` | Yes, immediately | Yes, after the first `pacman -Syu` |
+| Works offline after setup | Yes | Yes |
 
-```bash
-tools/package-linuxfs.sh \
-  --root /path/to/arch-rootfs \
-  --version 2026.12 \
-  --out dist/ \
-  --base-url https://github.com/MarkisLin/linuxdesk-components/releases/download/linuxfs-2026.12
+Free space needed: about 6 GB. The download resumes if interrupted; the app verifies the size and,
+when published, the SHA-256 before touching an existing installation.
+
+### Self-check and repair
+
+Both live in the app's left rail. The check covers roughly thirty items: binaries, shipped scripts,
+the EGL patch hash, the Venus socket, niri/DMS/quickshell sockets, PulseAudio and its two nodes, both
+D-Bus bridges, and the network snapshot. Items that only exist while a desktop is running are
+reported as `SKIP` rather than `FAIL`, so the check is meaningful on an idle tablet.
+
+Repair is idempotent: it re-stages assets, restores the EGL patch and symlinks, rewrites
+`/etc/os-release`, reinstalls the `pactl` wrapper, re-applies the DMS audio patch and restarts the
+bridges. If no session is running it raises the desktop in **picture-in-picture** to do the work,
+then dismisses it.
+
+## Verified hardware
+
+| Device | SoC / GPU | Android | Result |
+| --- | --- | --- | --- |
+| Redmi K Pad (`25079RPDCC`) | MediaTek MT8799 / Mali-G925-Immortalis MC12 | 16 | Daily driver: niri + DMS, Chromium, VLC, terminals, audio in/out, mouse + touch |
+
+Other devices are untested. The risky assumptions are: a Vulkan driver that accepts Venus, a Mali or
+Adreno GPU with dmabuf export, and 4+ GB of free space. Devices without a working Vulkan ICD will
+fall back to software rendering and be unusably slow.
+
+## Design decisions
+
+**PRoot, not chroot.** Root is unavailable on retail devices and unlocking the bootloader costs
+warranty, Play Integrity and often the camera. PRoot intercepts path-resolving syscalls in user space
+and needs no privileges. The cost is real: no namespaces, no `mount`, no real `/proc`, no `setuid`.
+
+**niri, not a floating compositor.** A tablet is a keyboard-less, mouse-less rectangle. Scrollable
+tiling gives every window a predictable full-height column, gestures map naturally to horizontal
+scrolling, and there is no fiddly window chrome to hit with a finger.
+
+**DankMaterialShell, not a hand-written shell.** Quickshell gives a mature bar, dock, control centre
+and settings UI for free, in QML, which is fast to iterate on. It also means the shell is an ordinary
+Wayland client, so a shell crash does not take the session down.
+
+**Patched EGL, not a patched Mesa.** Rebuilding Mesa for aarch64 on-device is slow and fragile; two
+instruction patches to the EGL loader plus a wrapper that re-applies them survive `pacman` upgrades
+and cost nothing at runtime.
+
+**Bridges, not services.** Shipping a full NetworkManager or BlueZ inside a container means D-Bus
+policy, netlink access and kernel modules that PRoot cannot provide. Reporting Android's state over
+the same bus names gets 95% of the visible value for 5% of the work — and it is honest about what it
+cannot do: it does not join networks, it describes the one Android already joined.
+
+**Official tarball + provision, not a frozen image.** A frozen image is easy to ship and impossible
+to maintain. Provisioning keeps `pacman` useful, lets users install their own software, and keeps the
+delta between releases small.
+
+## Known limitations
+
+These are not bugs on a list; they are the shape of the current design.
+
+- **No sandboxing.** PRoot provides no namespaces, so `bwrap`, Chromium's zygote sandbox and
+  QtWebEngine's sandbox cannot work. The runtime ships a `bwrap` compatibility shim and launch
+  wrappers pass `--no-sandbox`; the real security boundary is the Android app sandbox (UID + SELinux).
+  Electron apps, Chromium-family browsers and anything shipping `chrome-sandbox` need that flag.
+- **Indirect GPU.** There is no DRM render node. Applications that probe `/dev/dri` or require GBM
+  will not find one. Everything renders through Vulkan/kopper, which is fast but not identical to a
+  native Linux GPU stack.
+- **No `systemd`.** Services are ordinary scripts supervised by the session. Timers, socket
+  activation and dependency ordering do not exist; anything that assumes `systemctl` will not work.
+- **Background execution is Android's call.** The system may kill the session under memory pressure,
+  and network access is blocked for background UIDs — a download must run with the app in the
+  foreground, which is why the installer keeps a foreground notification.
+- **Incomplete hardware panels.** DMS can show the current network and paired Bluetooth devices, but
+  not scan for new Wi-Fi networks or pair new devices: those operations live behind Android APIs the
+  bridges do not call yet.
+- **Single sink, single source.** Audio is routed to the default output; per-app routing, HDMI and
+  multiple microphones are not modelled.
+- **Nested presentation.** The guest compositor renders into a `Surface` that Android then composites.
+  There is no direct scanout, so there is a fixed small cost per frame and no HDR.
+- **Patch upkeep.** The EGL patch is tied to the `libEGL_mesa` layout of a Mesa major version. A
+  `pacman -Syu` that jumps far enough can invalidate it; the self-check detects it and the repair
+  tool restores it, but the patch has to be re-derived eventually.
+- **One tested SoC.** Everything here was developed against Mali + Venus. Adreno has a different
+  Vulkan story and is untested.
+
+## Roadmap
+
+**Near term — make the daily driver boring**
+
+- Provision without the app in the foreground (foreground service + resumable download).
+- Replace the "start desktop at launch" guesswork with a proper session lifecycle (survive
+  configuration changes, restore after low-memory kill).
+- Finish the hardware panels honestly: report what is known, disable what is not supported instead of
+  showing an empty list.
+- Fix the remaining niri output-recreation churn and the LibreOffice `/proc` startup failure.
+
+**Mid term — make it installable by strangers**
+
+- Ship `dms`, quickshell and the patches as real `pacman` packages from a signed repository, so
+  `pacman -Syu` updates the desktop too.
+- Publish the app source, signed builds and reproducible packaging; document a second device.
+- A migration path between official and prebuilt runtimes, and a rollback to the previous rootfs.
+- Structured bridges: call `WifiManager`/`BluetoothAdapter` from the host and expose a small typed
+  interface to the guest, instead of maintaining D-Bus mocks.
+
+**Long term — the shape of the thing**
+
+- A real init inside the guest (runit/s6 style) so services are declared, not hand-supervised.
+- Zero-copy presentation: dmabuf straight into the Android compositor, frame pacing tied to the
+  panel's vsync.
+- Support for external displays, hardware keyboards and trackpads as first-class inputs.
+- A path to proper isolation (containers or a VM) where the platform allows it, with PRoot as the
+  universal fallback.
+
+## Repository layout
+
+```
+.
+├── README.md                    this file
+├── README.zh-CN.md             Chinese translation
+├── linuxfs-arch-official.json  default catalog (official tarball + provision)
+├── linuxfs-arch.json           fallback catalog (prebuilt runtime)
+├── docs/
+│   ├── rendering.md            graphics pipeline, kopper, GPU verification
+│   ├── runtime-layout.md       where files live, session start order
+│   └── publishing.md           packaging, releases, rollback
+└── CHANGELOG.md
 ```
 
-它会自动剔除上节列出的目录，用 `zstd -6 -T0` 压缩，并输出 `linuxfs-arch-<version>.tar.zst` 与
-`linuxfs-arch.json`（含新算出的 `sha256` 与 `size`）。
+This repository holds artifacts and manifests, not application source. The app, the native
+compositor and the packaging scripts live in the app repository (`linuxdesk/`), including
+`tools/package-linuxfs.sh` and `tools/provision/`.
 
-### 发一个版本
+## License
 
-1. 打包（上一步），确认 `tar --zstd -tf` 能列出内容、`zstd -t` 通过。
-2. 建 tag `linuxfs-<version>` 与同名 Release，把 `.tar.zst` 传上去。
-3. 把新的 `linuxfs-arch.json` 覆盖到本仓库根目录并提交——**App 只认这个文件**。
-4. 老的 Release 保留不删：已经装好的用户不需要重新下载。
-
-`upload.sh` 是把上面几步串起来的脚本（建仓库 / 发 Release / 传资产 / 回写 catalog），
-
-### 版本约定
-
-- tag：`linuxfs-YYYY.MM`（如 `linuxfs-2026.11`）
-- catalog 永远在 `main` 根目录，文件名固定 `linuxfs-arch.json`
-- 同一个版本号不重复发布；要改内容就升版本号
-
----
-
-## 排障
-
-用户侧只有两个入口，都在 App 左侧栏的 **自检** 页：
-
-- **运行自检** — 27 项检查，覆盖二进制、随包脚本、EGL 补丁哈希、Venus socket、niri/DMS/quickshell
-  socket、PulseAudio 及其两个节点、两个 D-Bus 服务、以及 guest 里那份手机网络状态。
-- **修复** — 重新 stage 资产、还原 EGL 与符号链接、重写 `/etc/os-release`、补回 `pactl` 包装、
-  重打 DMS 音频补丁、重启两个 D-Bus 服务。桌面没在跑时它会以**画中画**方式拉起桌面再修，
-  不打断当前页面。修复是幂等的，第二次跑会得到 `SUMMARY fixed=0`。
-
-日志（在 App 私有目录里，`run-as` 或文件管理器可读）：
-
-| 文件 | 内容 |
-| --- | --- |
-| `files/logs/tools/selfcheck.log` | 最近一次自检的逐条结果 |
-| `files/logs/tools/repair.log` | 最近一次修复的逐条结果 |
-| `files/logs/<session>/desktop.log` | 桌面会话的启动过程与退出码 |
-
-### 常见现象
-
-| 现象 | 原因 | 处理 |
-| --- | --- | --- |
-| 桌面能进但顶栏显示"未找到输出设备" | DMS 没读到 PulseAudio 的 sink | 自检看 `audio-sink`；点"修复"重打音频补丁 |
-| Wi-Fi 页空白 | `dd-nmmock` 没在 system bus 上占名 | 自检看 `nm-bus`；重新打开桌面或点"修复" |
-| 蓝牙页空白 | `dd-bluez` 同上 | 自检看 `bt-bus` |
-| 桌面黑屏 / 帧不动 | EGL 被换回原版，zink 退回 `wl_shm` | 自检看 `egl-patched` 的 md5，或点"修复" |
-| 桌面起不来，`desktop.log` 里 `LXQt ended (139)` | Venus 的 vtest server 没起来（渲染通路断了） | 自检看 `venus-socket`，重启 App |
-| 中文界面下音量显示"静音"且不可调 | 少了 `pactl` 包装，DMS 正则匹配不到 | 自检看 `pactl-wrapper` |
-
----
-
-## 文档
-
-| 文档 | 内容 |
-| --- | --- |
-| [`docs/rendering.md`](docs/rendering.md) | 渲染通路：为什么需要 kopper 补丁、为什么 DMS 用原版 EGL、如何确认真的跑在 GPU 上 |
-| [`docs/runtime-layout.md`](docs/runtime-layout.md) | 目录导览：关键文件在哪、运行时产物在哪、一次会话的启动顺序 |
-| [`docs/publishing.md`](docs/publishing.md) | 发布流程：打包、发 Release、更新 catalog、回滚、检查清单 |
-| [`CHANGELOG.md`](CHANGELOG.md) | 版本变更记录 |
-
-## 相关仓库
-
-- App 仓库：`linuxdesk/`（Kotlin + Jetpack Compose + NDK 合成器）
-- 打包脚本：`linuxdesk/tools/package-linuxfs.sh`
-- 运行时细节：`linuxdesk/docs/development/arch-desktop-runtime.md`
-
-本仓库只承载产物与清单，不放源码；改动请走 App 仓库。
-
-## 许可
-
-rootfs 内的软件各自遵循其上游许可证（Arch Linux ARM 及其包）。本仓库的脚本与清单部分待定，
-在正式开源前会补充明确的 LICENSE 文件。
+The runtime contains software from Arch Linux ARM and its upstream projects; each package keeps its
+own license. The scripts, catalogs and documentation in this repository are intended to be released
+under the MIT license — the formal `LICENSE` file is still pending, so treat this paragraph as the
+intent rather than the instrument.
