@@ -21,6 +21,21 @@ App（`com.dsh.linuxdesk`）本身不携带 rootfs，首次启动时按 `linuxfs
 下载地址与校验值都在 [`linuxfs-arch.json`](linuxfs-arch.json) 里，Release 资产名为
 `linuxfs-arch-2026.11.tar.zst`（zstd 压缩的 tar，`tar --zstd -xf` 即可展开）。
 
+### 两种下载源
+
+App 默认走**官方源**：catalog 是 [`linuxfs-arch-official.json`](linuxfs-arch-official.json)，
+`kind: "official"`，直接指向 Arch Linux ARM 官方的
+`ArchLinuxARM-aarch64-latest.tar.gz`（约 830 MB）。下载解包后，第一次启动桌面时由
+`archdesk-provision` 用 pacman 装上 niri / quickshell / Mesa / Qt6 等 34 个顶层包（约 400 个包），
+所以系统可以跟着 Arch 仓库滚动更新，不需要换整个镜像。
+
+想省掉首次配置、拿一个"开箱即用"的成品根文件系统时，改用 `linuxfs-arch.json`
+（`kind: "rootfs"`，1.76 GB 整包）。构建时可以覆盖：
+
+```bash
+./gradlew assembleDebug -PdroiddeckCatalog=https://raw.githubusercontent.com/MarkisLin/linuxdesk-components/main/linuxfs-arch.json
+```
+
 ---
 
 ## 这个运行时里有什么

@@ -1,0 +1,7 @@
+{
+  "version": "2026.11-stock",
+  "kind": "official",
+  "format": "tar.gz",
+  "url": "https://mirrors.aliyun.com/archlinuxarm/os/ArchLinuxARM-aarch64-latest.tar.gz",
+  "size": 829367415
+}
