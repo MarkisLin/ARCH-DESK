@@ -18,6 +18,32 @@ This repository holds the catalogs the app reads, the script that turns a stock 
 tarball into a desktop, and a prebuilt runtime for people who would rather skip that step. The app
 and the native compositor live in the app repository.
 
+## Why
+
+A tablet already contains the machine people buy a laptop for: eight cores, a current GPU, more
+memory than a netbook, and a 3K screen. What it does not contain is a way to use any of that for
+anything other than a phone app. One app fills the screen, files stay inside the app that made them,
+and there is no shell, no compiler, no window manager.
+
+The usual escapes each give something up:
+
+| Escape | What it costs |
+| --- | --- |
+| SSH into a server | needs a server and a connection; the tablet's own hardware sits idle |
+| Termux | a terminal, not a desktop; no window management, no accelerated session |
+| DeX / desktop mode | still Android apps, so the software a desktop needs is still missing |
+| Cloud desktop | latency, bandwidth, a subscription, and nothing offline |
+| Emulator | emulates the CPU, so everything runs slower than the tablet can |
+| Virtual machine | not available on retail devices without unlocking the bootloader |
+
+This project takes the remaining option: run what already exists for Linux on ARM, natively, on the
+tablet's own hardware, without root and without a VM. The parts are there — Arch Linux ARM has an
+aarch64 build of nearly everything, and the GPU is reachable through Vulkan. What was missing was the
+plumbing between them, and a way to keep that plumbing working after updates.
+
+That second half is why the repository is shaped the way it is: a recipe and a small set of patches,
+rather than a frozen image that nobody can maintain.
+
 ## Hardware
 
 A mid-range 2026 tablet has eight cores, a recent GPU, 8–16 GB of RAM and a 3K screen. That is more
@@ -66,6 +92,84 @@ GL_RENDERER: zink Vulkan 1.3(Virtio-GPU Venus (Mali-G925-Immortalis MC12))
 
 `llvmpipe` or `softpipe` in that line means the patch is missing; the self-check page reports the
 same thing as `egl-patched`.
+
+## What it is for
+
+The goal is not to boot Linux on a tablet and take a screenshot. It is to make the tablet behave like
+the Linux machine it already is: a desktop that lasts a working day, keeps the GPU busy, accepts
+touch and a mouse the way people expect, and leaves `pacman` working so the system can be maintained
+instead of frozen at whatever shipped.
+
+That produced a list of acceptance criteria, and most of the work described below exists because one
+of them failed:
+
+- the compositor runs on the GPU, confirmed by the renderer string and not by how it feels;
+- the screen is filled at its native 3008 × 1880, with no letterboxing and no client-side title bar;
+- a tap lands where the finger is, and an external mouse drives the same pointer;
+- sound plays, the microphone records, and the shell's slider changes the real volume;
+- the session starts from the app without a terminal, and still starts after the app is reinstalled;
+- a check inside the guest can tell a broken install from a working one.
+
+## How it is put together
+
+Four layers, each with one job:
+
+| Layer | Where | Job |
+| --- | --- | --- |
+| Guest runtime | `files/linuxfs` | the Arch system: niri, the shell, Mesa, and whatever the user installs |
+| Session scripts | APK assets, staged on every launch | entry point, supervisor, audio/network/Bluetooth bridges, check and repair |
+| Provisioning | `archdesk-provision` and `packages.txt` | turn a stock tarball into that runtime, and repair drift later |
+| Catalogs | this repository | tell the app what to download and how to verify it |
+
+Scripts are staged out of the APK on every launch instead of being edited in place. The runtime is
+disposable: an update replaces it wholesale, so anything that has to survive belongs in the app. In
+the source tree the copy that counts is `linuxdesk/tools/linuxfs/overlay`; Gradle regenerates the
+asset directory from it before every build, which is why editing assets alone appears to do nothing.
+
+A session starts in this order:
+
+1. The app extracts or primes the runtime, then starts PulseAudio and the Venus test server inside
+   its own process.
+2. `startlxqtwayland` sets the guest environment (ICD, audio socket, session socket), re-applies the
+   EGL patch and its symlink, provisions on first boot, launches the desktop supervisor detached,
+   and `exec`s niri.
+3. The supervisor waits for niri's socket, derives `WAYLAND_DISPLAY` and `NIRI_SOCKET` from the
+   socket name, clears the GL variables, and starts the shell against the pristine EGL. It restarts
+   the shell if it dies, and patches the shell's audio service once the shell has unpacked it.
+4. Two small services claim the NetworkManager and BlueZ bus names and answer from Android state.
+5. The app's compositor presents the guest surfaces.
+
+## How this was developed
+
+Every subsystem went through the same loop, because guessing is expensive here: a wrong guess costs a
+build, an install and a session restart.
+
+1. Measure before changing anything. Frame problems were measured by counting distinct colours and
+   sampling specific pixels, not by judging a screenshot. `64,64,64` across the screen means an
+   unpainted surface; the bar has known colours; a region that used to hold a watermark has exactly
+   one colour once it is gone.
+2. Find the single link that is wrong. The desktop once painted nothing while every process was
+   alive, every layer was registered and the log was empty. That combination points at the client
+   being pushed onto the wrong GPU path, not at the shell.
+3. Change that link and measure again.
+4. Leave a check behind, so the next person can tell a broken install from a working one.
+
+The expensive mistakes are recorded in `docs/rendering.md` and in the commit history, because they
+cost more than the successes did:
+
+- The first EGL patch hit `dri2_initialize_wayland_drm`, a branch the software renderer never takes,
+  so it changed nothing.
+- A patch that should have worked appeared to do nothing because `libEGL_mesa.so.0` still pointed at
+  the unpatched file.
+- Sending one `wl_output` object to every client is a protocol violation. niri died with
+  `ContextLost` and took the session with it; each client has to receive the output object belonging
+  to its own connection.
+- The shell painted nothing while its layers were registered, because session-wide zink variables
+  pushed it back onto the Venus path. Clearing the environment and giving it a second EGL fixed it.
+- A relative-pointer binding made the compositor swallow absolute motion, so the cursor never moved
+  although events arrived. Removing one condition in the motion path fixed it.
+- A frozen runtime image was easy to publish and impossible to maintain. The official tarball plus a
+  provisioning script replaced it.
 
 ## Install
 
@@ -171,6 +275,9 @@ the guest falls back to software rendering.
 - **LibreOffice does not start yet.** It exits on `ERROR: /proc not mounted`.
 
 ## Roadmap
+
+The direction is to stop owning a frozen image and start owning a recipe. A recipe can be re-run,
+diffed and repaired; an image can only be downloaded again.
 
 - Provision without keeping the app in the foreground.
 - Ship `dms`, quickshell and the patches as `pacman` packages from a signed repository, so the
